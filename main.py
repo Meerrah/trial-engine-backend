@@ -1,183 +1,258 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import numpy as np
-import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
+from fastapi.responses import StreamingResponse
+from typing import Optional, List
+from datetime import date
+import uuid
+import re
 import sqlite3
-from typing import List, Optional
+import pytesseract
+from PIL import Image
+import io
+import csv
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  
+    allow_headers=["*"],  
 )
 
-DATABASE_NAME = "health_marketplace.db"
-
-# ─── 1. DATABASE ARCHITECTURE ───
+# --- 1. SQLITE DATABASE INITIALIZATION ---
 def init_db():
-    conn = sqlite3.connect(DATABASE_NAME)
+    conn = sqlite3.connect("clinical_data.db", check_same_thread=False)
     cursor = conn.cursor()
-    # Table for the Patient B2C Passport
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS patient_records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            patient_uuid TEXT NOT NULL,
-            age INTEGER,
-            ast_level REAL,
-            crp_level REAL,
-            current_dosage REAL,
-            opt_in_consent INTEGER DEFAULT 0
-        )
-    """)
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, password TEXT, patient_id TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS profiles (patient_id TEXT PRIMARY KEY, blood_group TEXT, hemo_genotype TEXT, metabolic_profile TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS ledger (record_id TEXT PRIMARY KEY, patient_id TEXT, category TEXT, date_logged TEXT, primary_content TEXT, secondary_subtext TEXT, is_monetized INTEGER, flagged_for_review INTEGER, is_voided INTEGER)''')
     conn.commit()
-    conn.close()
+    return conn
 
-init_db()
+db = init_db()
 
-# ─── 2. SIMULATE HISTORICAL MARKETPLACE DATA ───
-# Seed the database with 500 compliant patient profiles to kickstart our network data distribution
-def seed_initial_marketplace():
-    conn = sqlite3.connect(DATABASE_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM patient_records")
-    if cursor.fetchone()[0] == 0:
-        print("🗄️ Seeding local marketplace database with tokenized patient data...")
-        np.random.seed(42)
-        for _ in range(500):
-            cursor.execute("""
-                INSERT INTO patient_records (patient_uuid, age, ast_level, crp_level, current_dosage, opt_in_consent)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                f"usr_{np.random.randint(100000, 999999)}",
-                int(np.random.uniform(18, 75)),
-                float(np.random.uniform(12, 75)),
-                float(np.random.uniform(0.6, 8.5)),
-                float(np.random.uniform(20, 120)),
-                1 # Opted-in to the monetization network
-            ))
-        conn.commit()
-    conn.close()
+# --- 2. AUTHENTICATION SCHEMAS & ENDPOINTS ---
+class AuthPayload(BaseModel):
+    email: str
+    password: str
 
-seed_initial_marketplace()
+class PasswordResetPayload(BaseModel):
+    email: str
+    new_password: str
 
-# ─── 3. MACHINE LEARNING ENGINE INIT ───
-print("🤖 Initializing enterprise Random Forest model...")
-np.random.seed(42)
-n_samples = 2000
-ast = np.random.uniform(10, 80, n_samples)
-crp = np.random.uniform(0.5, 10.0, n_samples)
-dosage = np.random.uniform(10, 150, n_samples)
-toxicity_score = (0.3 * (ast / 40)) + (0.4 * (crp / 3.0)) + (0.5 * (dosage / 50))
-y = (toxicity_score > 2.2).astype(int)
-
-X = pd.DataFrame({"ast": ast, "crp": crp, "dosage": dosage})
-model = RandomForestClassifier(n_estimators=100, random_state=42)
-model.fit(X, y)
-print("✅ Core ML pipeline trained on base parameters.")
-
-
-# ─── 4. DATA STRUCTS & PIPELINES ───
-class CohortInput(BaseModel):
-    cohort_size: int
-    baseline_ast: float
-    baseline_crp: float
-    target_dosage: float
-
-class PatientRecordInput(BaseModel):
-    patient_uuid: str
-    age: int
-    ast_level: float
-    crp_level: float
-    current_dosage: float
-    opt_in_consent: bool
-
-
-# Endpoint A: Patient uploads record from B2C Health Passport
-@app.post("/api/v1/patient/record")
-def add_patient_record(data: PatientRecordInput):
-    try:
-        conn = sqlite3.connect(DATABASE_NAME)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO patient_records (patient_uuid, age, ast_level, crp_level, current_dosage, opt_in_consent)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (data.patient_uuid, data.age, data.ast_level, data.crp_level, data.current_dosage, 1 if data.opt_in_consent else 0))
-        conn.commit()
-        conn.close()
-        return {"status": "success", "message": "Record fully encrypted and added to network profile."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# Endpoint B: Enterprise runs predictions using values from the dashboard
-@app.post("/predict")
-def predict_toxicity(data: CohortInput):
-    np.random.seed(10)
-    sim_ast = np.random.normal(data.baseline_ast, 5, data.cohort_size)
-    sim_crp = np.random.normal(data.baseline_crp, 0.5, data.cohort_size)
-    sim_dosage = np.ones(data.cohort_size) * data.target_dosage
+@app.post("/auth/signup")
+async def signup(payload: AuthPayload):
+    cursor = db.cursor()
+    cursor.execute("SELECT email FROM users WHERE email = ?", (payload.email,))
+    if cursor.fetchone():
+        raise HTTPException(status_code=400, detail="Email already registered")
     
-    sim_X = pd.DataFrame({"ast": sim_ast, "crp": sim_crp, "dosage": sim_dosage})
-    predictions = model.predict(sim_X)
+    new_patient_id = f"PT-{str(uuid.uuid4().int)[:6]}"
+    cursor.execute("INSERT INTO users (email, password, patient_id) VALUES (?, ?, ?)", (payload.email, payload.password, new_patient_id))
+    cursor.execute("INSERT INTO profiles (patient_id, blood_group, hemo_genotype, metabolic_profile) VALUES (?, 'Unknown', 'Unknown', 'Unknown')", (new_patient_id,))
+    db.commit()
+    return {"message": "Account created", "patient_id": new_patient_id}
+
+@app.post("/auth/login")
+async def login(payload: AuthPayload):
+    cursor = db.cursor()
+    cursor.execute("SELECT password, patient_id FROM users WHERE email = ?", (payload.email,))
+    user = cursor.fetchone()
+    if not user or user[0] != payload.password:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    return {"message": "Login successful", "patient_id": user[1]}
+
+@app.post("/auth/reset-password")
+async def reset_password(payload: PasswordResetPayload):
+    cursor = db.cursor()
+    cursor.execute("SELECT email FROM users WHERE email = ?", (payload.email,))
+    if not cursor.fetchone():
+        raise HTTPException(status_code=404, detail="No account associated with this email.")
     
-    total_failed = int(np.sum(predictions))
-    total_safe = data.cohort_size - total_failed
-    pass_rate = round((total_safe / data.cohort_size) * 100, 1)
+    cursor.execute("UPDATE users SET password = ? WHERE email = ?", (payload.new_password, payload.email))
+    db.commit()
+    return {"message": "Password updated successfully"}
+
+
+# --- 3. PATIENT PROFILE SCHEMAS & ENDPOINTS ---
+class PatientProfile(BaseModel):
+    blood_group: str
+    hemo_genotype: str
+    metabolic_profile: str
+
+@app.get("/profile/{patient_id}")
+async def get_profile(patient_id: str):
+    cursor = db.cursor()
+    cursor.execute("SELECT blood_group, hemo_genotype, metabolic_profile FROM profiles WHERE patient_id = ?", (patient_id,))
+    profile = cursor.fetchone()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return {"blood_group": profile[0], "hemo_genotype": profile[1], "metabolic_profile": profile[2]}
+
+@app.post("/profile/{patient_id}")
+async def update_profile(patient_id: str, profile: PatientProfile):
+    cursor = db.cursor()
+    cursor.execute("UPDATE profiles SET blood_group = ?, hemo_genotype = ?, metabolic_profile = ? WHERE patient_id = ?", 
+                  (profile.blood_group, profile.hemo_genotype, profile.metabolic_profile, patient_id))
+    db.commit()
+    return {"message": "Profile updated successfully"}
+
+
+# --- 4. TOXICITY ENGINE ---
+class DynamicTrialPayload(BaseModel):
+    target_dosage_mg: float
+    molecular_weight: float
+    lipophilicity_logp: float
+
+@app.post("/predict/dynamic/{patient_id}")
+async def predict_dynamic_toxicity(patient_id: str, payload: DynamicTrialPayload):
+    cursor = db.cursor()
+    cursor.execute("SELECT metabolic_profile FROM profiles WHERE patient_id = ?", (patient_id,))
+    profile_row = cursor.fetchone()
+    genotype = profile_row[0] if profile_row else "Unknown"
     
-    importances = model.feature_importances_
+    cursor.execute("SELECT secondary_subtext FROM ledger WHERE patient_id = ? AND is_voided = 0 ORDER BY rowid DESC", (patient_id,))
+    ledger_rows = cursor.fetchall()
     
+    patient_ast = 25.0 
+    patient_crp = 1.0  
+    
+    for (subtext,) in ledger_rows:
+        if not subtext: continue
+        if patient_ast == 25.0:
+            ast_match = re.search(r'(?:AST|Aminotransferase)[\s\w\(\)]*:\s*(\d+\.?\d*)', subtext)
+            if ast_match: patient_ast = float(ast_match.group(1))
+        if patient_crp == 1.0:
+            crp_match = re.search(r'(?:CRP|Reactive Protein)[\s\w\(\)]*:\s*(\d+\.?\d*)', subtext)
+            if crp_match: patient_crp = float(crp_match.group(1))
+            
+    confidence_score = 0.99
+    if genotype == "Unknown":
+        confidence_score = 0.60; genetic_modifier = 1.0; imputation_flag = True
+    else:
+        imputation_flag = False
+        genetic_modifier = {"Ultra-Rapid": 0.4, "Extensive": 1.0, "Intermediate": 1.5, "Poor": 3.2}.get(genotype, 1.0)
+
+    simulated_stress_index = (payload.target_dosage_mg * payload.lipophilicity_logp * (patient_ast / 25.0)) * genetic_modifier
+    if simulated_stress_index > 400: safety_status = "CRITICAL RISK: Induced Hepatic Toxicity Expected"
+    elif simulated_stress_index > 180: safety_status = "BORDERLINE: Elevated Hepatocellular Stress Detected"
+    else: safety_status = "SAFE: Compound within calculated metabolic tolerance"
+
     return {
-        "synthetic_pass_rate": pass_rate,
-        "safe_profiles": total_safe,
-        "failed_profiles": total_failed,
-        "feature_importance": {
-            "dosage": round(importances[2] * 100, 1),
-            "ast": round(importances[0] * 100, 1),
-            "crp": round(importances[1] * 100, 1)
-        }
+        "imputed_data": imputation_flag, "confidence_score": confidence_score, 
+        "biological_clearance_multiplier": genetic_modifier, "calculated_stress_index": round(simulated_stress_index, 2), 
+        "clinical_safety_status": safety_status, "dynamic_metrics_used": {"AST": patient_ast, "CRP": patient_crp}
     }
-# Endpoint C: Enterprise uploads a massive CSV of clinical trial data
-@app.post("/predict/batch")
-async def predict_batch(file: UploadFile = File(...)):
-    if not file.filename.endswith('.csv'):
-        raise HTTPException(status_code=400, detail="Only CSV files are permitted for batch processing.")
+
+
+# --- 5. LEDGER SCHEMA & ENDPOINTS ---
+class EHRRecord(BaseModel):
+    record_id: str; patient_id: str; category: str; date_logged: date; primary_content: str
+    secondary_subtext: Optional[str] = None; is_monetized: bool = False; flagged_for_review: bool = False; is_voided: bool = False
+
+@app.post("/ledger/ingest")
+async def ingest_health_record(record: EHRRecord):
+    cursor = db.cursor()
+    cursor.execute('''INSERT INTO ledger (record_id, patient_id, category, date_logged, primary_content, secondary_subtext, is_monetized, flagged_for_review, is_voided)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
+                   (record.record_id, record.patient_id, record.category, record.date_logged, record.primary_content, record.secondary_subtext, int(record.is_monetized), int(record.flagged_for_review), int(record.is_voided)))
+    db.commit()
+    return {"status": "Success"}
+
+@app.get("/ledger/history/{patient_id}")
+async def get_patient_history(patient_id: str):
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM ledger WHERE patient_id = ? ORDER BY rowid DESC", (patient_id,))
+    rows = cursor.fetchall()
+    
+    records = []
+    for r in rows:
+        records.append({
+            "record_id": r[0], "patient_id": r[1], "category": r[2], "date_logged": r[3],
+            "primary_content": r[4], "secondary_subtext": r[5], 
+            "is_monetized": bool(r[6]), "flagged_for_review": bool(r[7]), "is_voided": bool(r[8])
+        })
+    return {"records": records}
+
+@app.post("/ledger/void/{record_id}")
+async def void_health_record(record_id: str):
+    cursor = db.cursor()
+    cursor.execute("UPDATE ledger SET is_voided = 1 WHERE record_id = ?", (record_id,))
+    db.commit()
+    return {"message": "Record permanently voided"}
+
+
+# --- 6. OCR EXTRACTION & CSV EXPORT ---
+@app.post("/ledger/upload")
+async def smart_upload_document(patient_id: str = Form(...), file: UploadFile = File(...)):
+    file_bytes = await file.read()
     
     try:
-        # Read the uploaded CSV directly into a Pandas DataFrame
-        df = pd.read_csv(file.file)
-        
-        # Verify the required biological markers are present
-        required_columns = ['ast', 'crp', 'dosage']
-        for col in required_columns:
-            if col not in df.columns:
-                raise HTTPException(status_code=400, detail=f"Missing critical biological marker column: {col}")
-        
-        # Isolate the core parameters for the model
-        X_batch = df[required_columns]
-        
-        # Run the Random Forest predictions across the entire dataset instantly
-        predictions = model.predict(X_batch)
-        
-        # Calculate enterprise analytics
-        total_records = len(predictions)
-        total_failed = int(np.sum(predictions))
-        total_safe = total_records - total_failed
-        pass_rate = round((total_safe / total_records) * 100, 1)
-        
-        return {
-            "status": "success",
-            "dataset_size": total_records,
-            "batch_pass_rate": pass_rate,
-            "safe_profiles": total_safe,
-            "failed_profiles": total_failed,
-            "message": f"Successfully processed {total_records} trial profiles."
-        }
-        
+        image = Image.open(io.BytesIO(file_bytes))
+        raw_text = pytesseract.image_to_string(image)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing dataset: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"OCR Engine Failed: {str(e)}")
+
+    pattern = r"([A-Za-z\s\,\(\)\-]+?)\s+(\d+\.?\d*)\s+(?:[HL]\s+)?([a-zA-Z\/]+)"
+    lines = raw_text.split('\n')
+    extracted_tests = []
+    
+    for line in lines:
+        match = re.search(pattern, line)
+        if match:
+            test_name = match.group(1).strip()
+            value = match.group(2).strip()
+            unit = match.group(3).strip()
+            if len(test_name) > 3 and test_name.lower() not in ['patient name', 'parameter', 'result', 'unit', 'dob', 'gender', 'age']:
+                extracted_tests.append(f"{test_name}: {value} {unit}")
+
+    if not extracted_tests:
+        return {"status": "Failed", "detail": "No readable metrics found on document."}
+
+    aggregated_results = " • ".join(extracted_tests)
+    cursor = db.cursor()
+    rec_id = f"tx-{str(uuid.uuid4().int)[:5]}"
+    
+    cursor.execute('''INSERT INTO ledger (record_id, patient_id, category, date_logged, primary_content, secondary_subtext, is_monetized, flagged_for_review, is_voided)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
+                   (rec_id, patient_id, "Lab Test", str(date.today()), "Extracted: Comprehensive Lab Panel", aggregated_results, 0, 0, 0))
+    db.commit()
+    return {"status": "Success", "features_extracted": len(extracted_tests)}
+
+@app.get("/ledger/export/{patient_id}")
+async def export_patient_data(patient_id: str):
+    cursor = db.cursor()
+    
+    # 1. Fetch Profile
+    cursor.execute("SELECT blood_group, hemo_genotype, metabolic_profile FROM profiles WHERE patient_id = ?", (patient_id,))
+    profile = cursor.fetchone()
+    
+    # 2. Fetch Active Ledger Records
+    cursor.execute("SELECT date_logged, category, primary_content, secondary_subtext FROM ledger WHERE patient_id = ? AND is_voided = 0 ORDER BY date_logged DESC", (patient_id,))
+    ledger_records = cursor.fetchall()
+
+    # 3. Construct CSV in Memory with UTF-8 BOM
+    stream = io.StringIO()
+    stream.write('\ufeff')  # This specific Byte Order Mark forces Excel to read the bullet points properly!
+    writer = csv.writer(stream)
+    
+    writer.writerow(["IN-SILICO PASSPORT: CLINICAL DATA EXPORT"])
+    writer.writerow(["Patient ID", patient_id])
+    if profile:
+        writer.writerow(["Blood Group", profile[0]])
+        writer.writerow(["Genotype", profile[1]])
+        writer.writerow(["Metabolic Profile", profile[2]])
+        
+    writer.writerow([])
+    writer.writerow(["Date", "Category", "Event", "Clinical Notes/Values"])
+    
+    for record in ledger_records:
+        writer.writerow([record[0], record[1], record[2], record[3]])
+        
+    # 4. Stream back to client as a downloadable file
+    response = StreamingResponse(iter([stream.getvalue()]), media_type="text/csv")
+    response.headers["Content-Disposition"] = f"attachment; filename=health_passport_{patient_id}.csv"
+    return response
